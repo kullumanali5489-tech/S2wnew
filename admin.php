@@ -963,10 +963,16 @@ function renderChannels(list) {
     const el = document.getElementById('ch-list');
     if (!list.length) { el.innerHTML = '<div style="color:var(--muted);font-size:13px">No channels found</div>'; return; }
     el.innerHTML = list.map(ch => `
-        <div class="ch-card" title="${ch.title}" onclick="playChannel(${JSON.stringify(ch.id)}, ${JSON.stringify(ch.title)})">
+        <div class="ch-card" title="${ch.title}" data-chid="${ch.id}" data-chtitle="${ch.title.replace(/"/g,'&quot;')}">
             <img src="${ch.logo}" onerror="this.src='assets/tv.png'" loading="lazy" alt="${ch.title}"/>
             <div class="ch-name">${ch.title}</div>
         </div>`).join('');
+    // Attach click handlers via event delegation (avoids inline onclick quoting issues)
+    el.querySelectorAll('.ch-card').forEach(card => {
+        card.addEventListener('click', () => {
+            playChannel(card.dataset.chid, card.dataset.chtitle);
+        });
+    });
 }
 
 function filterChannels(q) {
@@ -1015,6 +1021,7 @@ let _hlsInstance = null;
 let _currentChannelId = null;
 let _currentChannelName = null;
 let _currentStreamUrl = null;
+let _currentProxyUrl  = null;
 
 function playChannel(id, name) {
     _currentChannelId   = id;
@@ -1035,57 +1042,71 @@ async function fetchAndPlay(id, name) {
         showPlayerError(d?.message || 'Failed to get stream URL');
         return;
     }
-    // Try direct URL first; live.php proxy is available as fallback
-    const url = d.data.proxy; // use proxy so cookies/auth are handled server-side
-    _currentStreamUrl = d.data.direct;
-    document.getElementById('playerInfoUrl').textContent = d.data.direct;
-    startPlayback(url);
+    const directUrl = d.data.direct;
+    const proxyUrl  = d.data.proxy;
+    _currentStreamUrl = directUrl;
+    _currentProxyUrl  = proxyUrl;
+    document.getElementById('playerInfoUrl').textContent = directUrl;
+    // Try direct stream first; startPlayback handles fallback to proxy
+    startPlayback(directUrl, proxyUrl);
 }
 
-function startPlayback(url) {
+
+function startPlayback(url, fallbackUrl) {
     const video = document.getElementById('playerVideo');
 
-    // Destroy previous HLS instance
     if (_hlsInstance) { _hlsInstance.destroy(); _hlsInstance = null; }
     video.pause();
-    video.src = '';
+    video.removeAttribute('src');
+    video.load();
 
-    const isHls = url.includes('.m3u8') || url.includes('.php') || url.includes('m3u');
+    document.getElementById('playerLoading').style.display = 'flex';
+    document.getElementById('playerError').style.display   = 'none';
+    video.style.display = 'block';
 
-    if (isHls && typeof Hls !== 'undefined' && Hls.isSupported()) {
+    function onFatal(detail) {
+        // Direct URL failed — try server proxy as fallback
+        if (fallbackUrl && url !== fallbackUrl) {
+            console.warn('Direct stream failed (' + detail + '), trying proxy…');
+            startPlayback(fallbackUrl, null);
+        } else {
+            showPlayerError('Stream unavailable (' + detail + ')');
+        }
+    }
+
+    if (typeof Hls !== 'undefined' && Hls.isSupported()) {
         _hlsInstance = new Hls({
             enableWorker: true,
             lowLatencyMode: true,
             backBufferLength: 30,
+            xhrSetup: function(xhr) {
+                xhr.withCredentials = false;
+            }
         });
         _hlsInstance.loadSource(url);
         _hlsInstance.attachMedia(video);
         _hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
             document.getElementById('playerLoading').style.display = 'none';
-            video.style.display = 'block';
             video.play().catch(() => {});
         });
         _hlsInstance.on(Hls.Events.ERROR, (evt, data) => {
             if (data.fatal) {
-                showPlayerError('Stream error: ' + (data.details || 'unknown'));
+                _hlsInstance.destroy(); _hlsInstance = null;
+                onFatal(data.details || 'fatal');
             }
         });
     } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-        // Native HLS (Safari/iOS)
+        // Native HLS (Safari / iOS)
         video.src = url;
         video.addEventListener('loadedmetadata', () => {
             document.getElementById('playerLoading').style.display = 'none';
-            video.style.display = 'block';
             video.play().catch(() => {});
         }, { once: true });
-        video.addEventListener('error', () => {
-            showPlayerError('Playback failed — stream may be offline');
-        }, { once: true });
+        video.addEventListener('error', () => onFatal('native error'), { once: true });
     } else {
-        // Direct link fallback (TS streams etc.)
+        // Last resort direct src
         video.src = url;
         document.getElementById('playerLoading').style.display = 'none';
-        video.style.display = 'block';
         video.play().catch(() => {});
     }
 }
