@@ -187,15 +187,16 @@ function mac_auth_headers($token = '') {
 }
 
 // ── Handshake — get Bearer token ──────────────────────────────────────────────
-function mac_handshake() {
+// $force = true skips cache and always does a fresh handshake (required for create_link)
+function mac_handshake($force = false) {
     $tf = DATA_DIR . '/token.json';
-    if (file_exists($tf)) {
+    if (!$force && file_exists($tf)) {
         $d = json_decode(file_get_contents($tf), true);
         if (!empty($d['token']) && time() < ($d['expires'] ?? 0))
             return ['token' => $d['token'], 'random' => $d['random'] ?? ''];
     }
 
-    // First warm up the portal page so Cloudflare sets its cf_clearance cookie
+    // Warm up the portal so Cloudflare sets cf_clearance cookie
     stb_request(mac_portal_url(), [], mac_portal_url());
 
     $url = mac_server_url() . '?type=stb&action=handshake&token=&JsHttpRequest=1-xml';
@@ -210,10 +211,11 @@ function mac_handshake() {
         return ['token' => '', 'random' => ''];
     }
 
+    // Cache for 90s (conservative — some portals expire tokens faster than 120s)
     file_put_contents($tf, json_encode([
         'token'   => $token,
         'random'  => $random,
-        'expires' => time() + 120,
+        'expires' => time() + 90,
     ]));
     return ['token' => $token, 'random' => $random];
 }
@@ -302,14 +304,27 @@ function mac_get_stream_url($id) {
     $ch = get_channel_by_id($id);
     if (empty($ch)) return '';
 
-    $hs  = mac_handshake();
+    // Always force a fresh token for create_link — stale tokens cause "Authorization failed. 75"
+    @unlink(DATA_DIR . '/token.json');
+    $hs = mac_handshake(true);
     if (empty($hs['token'])) return '';
 
-    $url = mac_server_url() . '?type=itv&action=create_link&cmd=' . urlencode($ch['cmd']) . '&JsHttpRequest=1-xml';
+    // Send full params that a real MAG250 sends with create_link
+    $qs = 'type=itv&action=create_link'
+        . '&cmd='               . urlencode($ch['cmd'])
+        . '&series=0'
+        . '&forced_storage=undefined'
+        . '&disable_ad=0'
+        . '&download=0'
+        . '&force_ch_link_check=0'
+        . '&JsHttpRequest=1-xml';
+
+    $url = mac_server_url() . '?' . $qs;
     $res = stb_request($url, mac_auth_headers($hs['token']), mac_portal_url());
     $j   = json_decode($res['body'], true);
 
     if (empty($j['js']['cmd'])) {
+        // If still failing, log the raw response for debugging
         app_log('ERROR', 'Stream URL fetch failed: ' . strip_tags($res['body']) . ' (HTTP ' . $res['code'] . ')');
         return '';
     }
