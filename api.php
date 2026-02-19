@@ -124,6 +124,18 @@ if ($action === 'export_m3u') {
     exit($m3u);
 }
 
+if ($action === 'get_stream_url') {
+    $id = trim($_POST['id'] ?? '');
+    if (empty($id)) json_resp('error', 400, 'Channel ID required');
+    if (empty(mac_server_url())) json_resp('error', 503, 'Portal not configured');
+    $url = mac_get_stream_url($id);
+    if (empty($url)) json_resp('error', 502, 'Could not get stream URL — check logs');
+    global $PROTO, $HOST;
+    $base = $PROTO . '://' . $HOST . str_replace(basename($_SERVER['PHP_SELF']), '', $_SERVER['PHP_SELF']);
+    $proxy_url = $base . 'live.php?id=' . urlencode($id);
+    json_resp('success', 200, 'OK', ['direct' => $url, 'proxy' => $proxy_url]);
+}
+
 if ($action === 'logs') {
     $f = DATA_DIR . '/app.log';
     $logs = file_exists($f) ? file_get_contents($f) : 'No logs yet.';

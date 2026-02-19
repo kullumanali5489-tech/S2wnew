@@ -12,6 +12,7 @@ $authed = !empty($_SESSION['auth']);
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet"/>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.2/css/all.min.css"/>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.7/hls.min.js"></script>
 <style>
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -431,6 +432,108 @@ body::after {
     .main { margin-left: 60px; padding: 20px 16px; }
     .topbar h1 { font-size: 18px; }
 }
+
+/* ── Player Modal ─────────────────────────────────── */
+.player-overlay {
+    position: fixed; inset: 0; z-index: 100;
+    background: rgba(0,0,0,0.92);
+    display: none; align-items: center; justify-content: center;
+    backdrop-filter: blur(8px);
+}
+.player-overlay.open { display: flex; }
+
+.player-wrap {
+    position: relative;
+    width: min(900px, 96vw);
+    background: #000;
+    border-radius: 16px;
+    overflow: hidden;
+    box-shadow: 0 40px 100px rgba(0,0,0,0.8);
+    animation: playerIn 0.3s cubic-bezier(0.34,1.56,0.64,1) both;
+}
+@keyframes playerIn {
+    from { opacity:0; transform: scale(0.92); }
+    to   { opacity:1; transform: scale(1); }
+}
+
+.player-topbar {
+    position: absolute; top: 0; left: 0; right: 0; z-index: 10;
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 18px;
+    background: linear-gradient(to bottom, rgba(0,0,0,0.85) 0%, transparent 100%);
+}
+.player-title {
+    font-size: 14px; font-weight: 700;
+    color: #fff; text-shadow: 0 1px 4px rgba(0,0,0,0.8);
+    display: flex; align-items: center; gap: 8px;
+}
+.player-title .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #ff4444;
+    box-shadow: 0 0 8px #ff4444;
+    animation: blink 1s ease-in-out infinite;
+}
+@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+.player-close {
+    width: 32px; height: 32px; border-radius: 50%;
+    background: rgba(255,255,255,0.15);
+    border: none; color: #fff; font-size: 16px;
+    cursor: pointer; display: flex; align-items: center; justify-content: center;
+    transition: background 0.15s;
+}
+.player-close:hover { background: rgba(255,60,60,0.6); }
+
+.player-video-wrap {
+    position: relative;
+    width: 100%; padding-top: 56.25%; /* 16:9 */
+    background: #000;
+}
+.player-video-wrap video {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+}
+
+.player-loading {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 16px; background: #000;
+    color: var(--muted); font-size: 13px;
+    z-index: 5;
+}
+.player-loading .big-spinner {
+    width: 44px; height: 44px;
+    border: 3px solid rgba(108,99,255,0.2);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+}
+
+.player-error {
+    position: absolute; inset: 0;
+    display: none; flex-direction: column; align-items: center; justify-content: center;
+    gap: 12px; background: #0a0005;
+    color: var(--accent2); font-size: 14px; font-weight: 600;
+    z-index: 5; text-align: center; padding: 24px;
+}
+.player-error i { font-size: 40px; opacity: 0.6; }
+
+.player-info {
+    padding: 14px 18px;
+    background: #0d0d14;
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px;
+}
+.player-info-name { font-size: 13px; font-weight: 700; }
+.player-info-url  { font-size: 11px; font-family: var(--mono); color: var(--muted); word-break: break-all; flex: 1; margin: 0 12px; }
+.btn-copy {
+    background: rgba(108,99,255,0.15); border: 1px solid rgba(108,99,255,0.3);
+    color: var(--accent); border-radius: 6px; padding: 5px 10px;
+    font-size: 11px; font-family: var(--mono); cursor: pointer;
+    white-space: nowrap; flex-shrink: 0;
+    transition: background 0.15s;
+}
+.btn-copy:hover { background: rgba(108,99,255,0.3); }
+
 </style>
 </head>
 <body>
@@ -655,6 +758,39 @@ body::after {
 </div><!-- .shell -->
 <?php endif; ?>
 
+
+<!-- ── PLAYER MODAL ──────────────────────────────────────────────────────── -->
+<div class="player-overlay" id="playerOverlay" onclick="closePlayerOnBackdrop(event)">
+  <div class="player-wrap" id="playerWrap">
+    <div class="player-topbar">
+      <div class="player-title">
+        <span class="dot"></span>
+        <span id="playerChannelName">Loading…</span>
+      </div>
+      <button class="player-close" onclick="closePlayer()"><i class="fa-solid fa-xmark"></i></button>
+    </div>
+    <div class="player-video-wrap">
+      <div class="player-loading" id="playerLoading">
+        <div class="big-spinner"></div>
+        <span>Fetching stream…</span>
+      </div>
+      <div class="player-error" id="playerError">
+        <i class="fa-solid fa-circle-exclamation"></i>
+        <span id="playerErrorMsg">Stream unavailable</span>
+        <button class="btn btn-ghost" onclick="retryPlay()" style="margin-top:8px;font-size:12px">
+          <i class="fa-solid fa-rotate-right"></i> Retry
+        </button>
+      </div>
+      <video id="playerVideo" controls playsinline></video>
+    </div>
+    <div class="player-info">
+      <span class="player-info-name" id="playerInfoName"></span>
+      <span class="player-info-url" id="playerInfoUrl"></span>
+      <button class="btn-copy" onclick="copyStreamUrl()" id="copyBtn">Copy URL</button>
+    </div>
+  </div>
+</div>
+
 <!-- Toast container -->
 <div class="toast-wrap" id="toasts"></div>
 
@@ -827,7 +963,7 @@ function renderChannels(list) {
     const el = document.getElementById('ch-list');
     if (!list.length) { el.innerHTML = '<div style="color:var(--muted);font-size:13px">No channels found</div>'; return; }
     el.innerHTML = list.map(ch => `
-        <div class="ch-card" title="${ch.title}">
+        <div class="ch-card" title="${ch.title}" onclick="playChannel(${JSON.stringify(ch.id)}, ${JSON.stringify(ch.title)})">
             <img src="${ch.logo}" onerror="this.src='assets/tv.png'" loading="lazy" alt="${ch.title}"/>
             <div class="ch-name">${ch.title}</div>
         </div>`).join('');
@@ -872,6 +1008,121 @@ async function loadLogs() {
     const d = await api('logs').catch(() => null);
     document.getElementById('log-box').textContent = d?.data || 'No logs available';
 }
+
+
+// ── Player ─────────────────────────────────────────────────────────────────
+let _hlsInstance = null;
+let _currentChannelId = null;
+let _currentChannelName = null;
+let _currentStreamUrl = null;
+
+function playChannel(id, name) {
+    _currentChannelId   = id;
+    _currentChannelName = name;
+    document.getElementById('playerChannelName').textContent = name;
+    document.getElementById('playerInfoName').textContent    = name;
+    document.getElementById('playerInfoUrl').textContent     = '';
+    document.getElementById('playerOverlay').classList.add('open');
+    document.getElementById('playerLoading').style.display  = 'flex';
+    document.getElementById('playerError').style.display    = 'none';
+    document.getElementById('playerVideo').style.display    = 'none';
+    fetchAndPlay(id, name);
+}
+
+async function fetchAndPlay(id, name) {
+    const d = await api('get_stream_url', {id}).catch(() => null);
+    if (!d || d.status !== 'success') {
+        showPlayerError(d?.message || 'Failed to get stream URL');
+        return;
+    }
+    // Try direct URL first; live.php proxy is available as fallback
+    const url = d.data.proxy; // use proxy so cookies/auth are handled server-side
+    _currentStreamUrl = d.data.direct;
+    document.getElementById('playerInfoUrl').textContent = d.data.direct;
+    startPlayback(url);
+}
+
+function startPlayback(url) {
+    const video = document.getElementById('playerVideo');
+
+    // Destroy previous HLS instance
+    if (_hlsInstance) { _hlsInstance.destroy(); _hlsInstance = null; }
+    video.pause();
+    video.src = '';
+
+    const isHls = url.includes('.m3u8') || url.includes('.php') || url.includes('m3u');
+
+    if (isHls && typeof Hls !== 'undefined' && Hls.isSupported()) {
+        _hlsInstance = new Hls({
+            enableWorker: true,
+            lowLatencyMode: true,
+            backBufferLength: 30,
+        });
+        _hlsInstance.loadSource(url);
+        _hlsInstance.attachMedia(video);
+        _hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+            document.getElementById('playerLoading').style.display = 'none';
+            video.style.display = 'block';
+            video.play().catch(() => {});
+        });
+        _hlsInstance.on(Hls.Events.ERROR, (evt, data) => {
+            if (data.fatal) {
+                showPlayerError('Stream error: ' + (data.details || 'unknown'));
+            }
+        });
+    } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        // Native HLS (Safari/iOS)
+        video.src = url;
+        video.addEventListener('loadedmetadata', () => {
+            document.getElementById('playerLoading').style.display = 'none';
+            video.style.display = 'block';
+            video.play().catch(() => {});
+        }, { once: true });
+        video.addEventListener('error', () => {
+            showPlayerError('Playback failed — stream may be offline');
+        }, { once: true });
+    } else {
+        // Direct link fallback (TS streams etc.)
+        video.src = url;
+        document.getElementById('playerLoading').style.display = 'none';
+        video.style.display = 'block';
+        video.play().catch(() => {});
+    }
+}
+
+function showPlayerError(msg) {
+    document.getElementById('playerLoading').style.display = 'none';
+    document.getElementById('playerVideo').style.display   = 'none';
+    document.getElementById('playerError').style.display   = 'flex';
+    document.getElementById('playerErrorMsg').textContent  = msg;
+}
+
+function retryPlay() {
+    if (_currentChannelId) playChannel(_currentChannelId, _currentChannelName);
+}
+
+function closePlayer() {
+    document.getElementById('playerOverlay').classList.remove('open');
+    const video = document.getElementById('playerVideo');
+    video.pause(); video.src = '';
+    if (_hlsInstance) { _hlsInstance.destroy(); _hlsInstance = null; }
+}
+
+function closePlayerOnBackdrop(e) {
+    if (e.target === document.getElementById('playerOverlay')) closePlayer();
+}
+
+function copyStreamUrl() {
+    if (!_currentStreamUrl) return;
+    navigator.clipboard.writeText(_currentStreamUrl).then(() => {
+        const b = document.getElementById('copyBtn');
+        b.textContent = 'Copied!';
+        setTimeout(() => b.textContent = 'Copy URL', 1500);
+    });
+}
+
+// Close player on Escape key
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closePlayer(); });
 
 // ── Boot ───────────────────────────────────────────────────────────────────────
 loadDashboard();
