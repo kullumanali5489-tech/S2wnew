@@ -62,7 +62,7 @@ function portal_save($data) {
     return (bool) file_put_contents(DATA_DIR . '/portal.json', json_encode($data));
 }
 function portal_delete() {
-    foreach (['/portal.json','/token.json','/channels.json','/meta.json'] as $f)
+    foreach (['/portal.json','/token.json','/channels.json','/meta.json','/cookies.txt'] as $f)
         @unlink(DATA_DIR . $f);
 }
 
@@ -85,51 +85,27 @@ function app_log($status, $msg) {
     file_put_contents($f, date('Y-m-d H:i:s')." | {$status} | {$msg} | {$ip} | {$ua}\n" . $cur);
 }
 
-// ── Cookie jar path ────────────────────────────────────────────────────────────
+// ── Cookie jar ────────────────────────────────────────────────────────────────
 function cookie_jar() {
     $jar = DATA_DIR . '/cookies.txt';
     if (!file_exists($jar)) file_put_contents($jar, '');
     return $jar;
 }
 
-// ── Core HTTP function — Cloudflare-resistant ─────────────────────────────────
-// Mimics a real MAG250 STB making requests through a browser-like stack.
-// Key fixes vs old version:
-//  1. Cookie jar — Cloudflare sets CF cookies on first hit; we must send them back
-//  2. Accept / Accept-Language / Accept-Encoding headers — missing = bot signal
-//  3. Connection: keep-alive
-//  4. Correct Referer set per-request
-//  5. CURLOPT_ENCODING so gzip/deflate responses are decoded automatically
-function stb_request($url, $extra_headers = [], $portal_url = '') {
+// ── Core HTTP — persistent cookie jar, proper STB headers ────────────────────
+function stb_get($url, $extra_headers = []) {
     $jar = cookie_jar();
-
-    $base_headers = [
-        'User-Agent: Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3',
-        'X-User-Agent: Model: MAG250; Link: WiFi',
-        'Accept: */*',
-        'Accept-Language: en-US,en;q=0.9',
-        'Accept-Encoding: gzip, deflate',
-        'Connection: keep-alive',
-    ];
-
-    if (!empty($portal_url)) {
-        $base_headers[] = 'Referer: ' . $portal_url;
-    }
-
-    $headers = array_merge($base_headers, $extra_headers);
-
-    $ch = curl_init($url);
+    $ch  = curl_init($url);
     curl_setopt_array($ch, [
-        CURLOPT_HTTPHEADER     => $headers,
+        CURLOPT_HTTPHEADER     => $extra_headers,
         CURLOPT_RETURNTRANSFER => true,
         CURLOPT_FOLLOWLOCATION => true,
         CURLOPT_TIMEOUT        => 30,
         CURLOPT_SSL_VERIFYPEER => false,
         CURLOPT_SSL_VERIFYHOST => false,
-        CURLOPT_ENCODING       => '',          // auto decode gzip/deflate
-        CURLOPT_COOKIEFILE     => $jar,        // read cookies
-        CURLOPT_COOKIEJAR      => $jar,        // write cookies (CF clearance etc.)
-        CURLOPT_USERAGENT      => 'Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3',
+        CURLOPT_ENCODING       => '',
+        CURLOPT_COOKIEFILE     => $jar,
+        CURLOPT_COOKIEJAR      => $jar,
     ]);
     $body = curl_exec($ch);
     $eff  = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
@@ -138,10 +114,8 @@ function stb_request($url, $extra_headers = [], $portal_url = '') {
     return ['body' => $body, 'url' => $eff, 'code' => $code];
 }
 
-// Keep http_get as alias for live.php stream proxying (no portal cookie needed)
-function http_get($url, $headers = []) {
-    return stb_request($url, $headers);
-}
+// Alias used by live.php
+function http_get($url, $headers = []) { return stb_get($url, $headers); }
 
 // ── URL helpers ───────────────────────────────────────────────────────────────
 function url_root($url) {
@@ -165,7 +139,7 @@ function fix_logo($logo) {
     if (!empty($logo) && (stripos($logo,'http://')!==false || stripos($logo,'https://')!==false)) return $logo;
     return $PROTO . '://' . $HOST . str_replace(basename($_SERVER['PHP_SELF']), '', $_SERVER['PHP_SELF']) . 'assets/tv.png';
 }
-function sanitize_stream_url($url) { return str_replace('ffmpeg ', '', $url); }
+function sanitize_stream_url($url) { return trim(str_replace('ffmpeg ', '', $url)); }
 function clean_str($s) { return preg_replace('/[^a-zA-Z0-9_\-]/', '_', $s); }
 
 // ── Portal field accessors ────────────────────────────────────────────────────
@@ -175,19 +149,33 @@ function mac_id()          { $p = portal_get(); return $p['mac_id']      ?? ''; 
 function mac_serial()      { $p = portal_get(); return $p['serial']      ?? ''; }
 function mac_dev1()        { $p = portal_get(); return $p['device_id1']  ?? ''; }
 function mac_dev2()        { $p = portal_get(); return $p['device_id2']  ?? ''; }
-function mac_signature()   { $p = portal_get(); return $p['signature']   ?? ''; }
+function mac_signature_v() { $p = portal_get(); return $p['signature']   ?? ''; }
 
-// ── Build STB request headers with auth token ──────────────────────────────────
-function mac_auth_headers($token = '') {
+// ── Build STB headers — CRITICAL: token must be in Cookie AND Bearer ──────────
+// This is the exact header set a real MAG250 sends. The token in the Cookie
+// is what most portals actually check — Bearer alone is often insufficient.
+function stb_headers($token = '') {
+    $cookie = 'mac=' . mac_id() . '; stb_lang=en; timezone=Europe/Kiev';
+    if (!empty($token)) {
+        $cookie .= '; token=' . $token;  // ← CRITICAL: token in cookie
+    }
     $h = [
-        'Cookie: mac=' . mac_id() . '; stb_lang=en; timezone=Europe/Kiev',
+        'User-Agent: Mozilla/5.0 (QtEmbedded; U; Linux; C) AppleWebKit/533.3 (KHTML, like Gecko) MAG200 stbapp ver: 2 rev: 250 Safari/533.3',
+        'X-User-Agent: Model: MAG250; Link: WiFi',
+        'Accept: */*',
+        'Accept-Language: en-US,en;q=0.5',
+        'Accept-Encoding: gzip, deflate',
+        'Connection: keep-alive',
+        'Referer: ' . mac_portal_url(),
+        'Cookie: ' . $cookie,
     ];
-    if (!empty($token)) $h[] = 'Authorization: Bearer ' . $token;
+    if (!empty($token)) {
+        $h[] = 'Authorization: Bearer ' . $token;
+    }
     return $h;
 }
 
-// ── Handshake — get Bearer token ──────────────────────────────────────────────
-// $force = true skips cache and always does a fresh handshake (required for create_link)
+// ── Handshake ─────────────────────────────────────────────────────────────────
 function mac_handshake($force = false) {
     $tf = DATA_DIR . '/token.json';
     if (!$force && file_exists($tf)) {
@@ -196,13 +184,13 @@ function mac_handshake($force = false) {
             return ['token' => $d['token'], 'random' => $d['random'] ?? ''];
     }
 
-    // Warm up the portal so Cloudflare sets cf_clearance cookie
-    stb_request(mac_portal_url(), [], mac_portal_url());
+    // Warm up the portal page first (sets Cloudflare cookies)
+    stb_get(mac_portal_url(), stb_headers());
 
     $url = mac_server_url() . '?type=stb&action=handshake&token=&JsHttpRequest=1-xml';
-    $res = stb_request($url, mac_auth_headers(), mac_portal_url());
+    $res = stb_get($url, stb_headers());
+    $j   = json_decode($res['body'], true);
 
-    $j = json_decode($res['body'], true);
     $token  = $j['js']['token']  ?? '';
     $random = $j['js']['random'] ?? '';
 
@@ -211,58 +199,61 @@ function mac_handshake($force = false) {
         return ['token' => '', 'random' => ''];
     }
 
-    // Cache for 90s (conservative — some portals expire tokens faster than 120s)
     file_put_contents($tf, json_encode([
         'token'   => $token,
         'random'  => $random,
-        'expires' => time() + 90,
+        'expires' => time() + 100,
     ]));
     return ['token' => $token, 'random' => $random];
 }
 
-// ── Get profile ───────────────────────────────────────────────────────────────
-function mac_get_profile() {
-    $hs = mac_handshake();
+// ── Get profile — MUST be called before create_link to authorise the session ──
+function mac_get_profile($hs = null) {
+    if ($hs === null) $hs = mac_handshake();
     if (empty($hs['token'])) return [];
 
     $qs = 'type=stb&action=get_profile&hd=1'
         . '&ver=' . urlencode('ImageDescription: 0.2.18-r14-pub-250; ImageDate: Fri Jan 15 15:20:44 EET 2016; PORTAL version: 5.1.0; API Version: JS API version: 328; STB API version: 134; Player Engine version: 0x566')
         . '&num_banks=2&sn=' . mac_serial()
         . '&stb_type=MAG250&image_version=218&video_out=hdmi'
-        . '&device_id=' . mac_dev1() . '&device_id2=' . mac_dev2()
-        . '&signature=' . mac_signature()
+        . '&device_id='  . mac_dev1()
+        . '&device_id2=' . mac_dev2()
+        . '&signature='  . mac_signature_v()
         . '&auth_second_step=1&hw_version=1.7-BD-00&not_valid_token=0&client_type=STB'
+        . '&hw_version_2=36da041e6358ee8f8801105e36a63474'
         . '&timestamp=' . time()
         . '&api_signature=263'
         . '&metrics=' . urlencode('{"mac":"' . mac_id() . '","sn":"' . mac_serial() . '","model":"MAG250","type":"STB","uid":"","random":"' . $hs['random'] . '"}')
         . '&JsHttpRequest=1-xml';
 
-    $res = stb_request(mac_server_url() . '?' . $qs, mac_auth_headers($hs['token']), mac_portal_url());
+    $res = stb_get(mac_server_url() . '?' . $qs, stb_headers($hs['token']));
     $j   = json_decode($res['body'], true);
 
     $name   = $j['js']['fname'] ?? ($j['js']['name'] ?? '');
     $expiry = $j['js']['expirydate'] ?? ($j['js']['expire_billing_date'] ?? '');
-    $user   = $j['js']['login']    ?? '';
-    $pass   = $j['js']['password'] ?? '';
 
     if (empty($name)) {
         app_log('ERROR', 'Profile fetch failed: ' . strip_tags($res['body']) . ' (HTTP ' . $res['code'] . ')');
         return [];
     }
 
-    $out = ['name' => $name, 'expiry' => $expiry, 'username' => $user, 'password' => $pass];
+    $out = [
+        'name'     => $name,
+        'expiry'   => $expiry,
+        'username' => $j['js']['login']    ?? '',
+        'password' => $j['js']['password'] ?? '',
+    ];
     file_put_contents(DATA_DIR . '/meta.json', json_encode($out));
     return $out;
 }
 
-// ── Get meta (cached) ─────────────────────────────────────────────────────────
 function mac_get_meta() {
     $f = DATA_DIR . '/meta.json';
     if (!file_exists($f)) return [];
     return json_decode(file_get_contents($f), true) ?: [];
 }
 
-// ── Get all channels ──────────────────────────────────────────────────────────
+// ── Get channels ──────────────────────────────────────────────────────────────
 function mac_get_channels($force = false) {
     $cf = DATA_DIR . '/channels.json';
     if (!$force && file_exists($cf)) {
@@ -270,11 +261,12 @@ function mac_get_channels($force = false) {
         if (!empty($d[0])) return $d;
     }
 
-    $hs = mac_handshake();
-    if (empty($hs['token'])) return [];
+    // Profile MUST be called before channel listing (authenticates session)
+    $hs = mac_handshake($force);
+    mac_get_profile($hs);
 
     $url = mac_server_url() . '?type=itv&action=get_all_channels&JsHttpRequest=1-xml';
-    $res = stb_request($url, mac_auth_headers($hs['token']), mac_portal_url());
+    $res = stb_get($url, stb_headers($hs['token']));
     $j   = json_decode($res['body'], true);
 
     if (empty($j['js']['data'][0]['cmd'])) {
@@ -291,7 +283,6 @@ function mac_get_channels($force = false) {
     return $out;
 }
 
-// ── Get single channel ────────────────────────────────────────────────────────
 function get_channel_by_id($id) {
     foreach (mac_get_channels() as $ch) {
         if ((string)$ch['id'] === (string)$id) return $ch;
@@ -299,17 +290,24 @@ function get_channel_by_id($id) {
     return [];
 }
 
-// ── Get stream URL for a channel ──────────────────────────────────────────────
+// ── Get stream URL ────────────────────────────────────────────────────────────
+// The correct auth sequence for create_link:
+//   1. Fresh handshake  → get token
+//   2. get_profile      → portal authorises this token for the MAC
+//   3. create_link      → now works because the session is fully authenticated
 function mac_get_stream_url($id) {
     $ch = get_channel_by_id($id);
     if (empty($ch)) return '';
 
-    // Always force a fresh token for create_link — stale tokens cause "Authorization failed. 75"
+    // Step 1: fresh token (never use cached token for stream requests)
     @unlink(DATA_DIR . '/token.json');
     $hs = mac_handshake(true);
     if (empty($hs['token'])) return '';
 
-    // Send full params that a real MAG250 sends with create_link
+    // Step 2: authenticate session via get_profile
+    mac_get_profile($hs);
+
+    // Step 3: create_link with full MAG250 params + token in cookie
     $qs = 'type=itv&action=create_link'
         . '&cmd='               . urlencode($ch['cmd'])
         . '&series=0'
@@ -319,12 +317,10 @@ function mac_get_stream_url($id) {
         . '&force_ch_link_check=0'
         . '&JsHttpRequest=1-xml';
 
-    $url = mac_server_url() . '?' . $qs;
-    $res = stb_request($url, mac_auth_headers($hs['token']), mac_portal_url());
+    $res = stb_get(mac_server_url() . '?' . $qs, stb_headers($hs['token']));
     $j   = json_decode($res['body'], true);
 
     if (empty($j['js']['cmd'])) {
-        // If still failing, log the raw response for debugging
         app_log('ERROR', 'Stream URL fetch failed: ' . strip_tags($res['body']) . ' (HTTP ' . $res['code'] . ')');
         return '';
     }
